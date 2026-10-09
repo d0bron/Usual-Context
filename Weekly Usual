@@ -1,0 +1,310 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace cAlgo.Robots
+{
+    public enum WeeklyContextType
+    {
+        WeeklySweep,
+        UsualFVG
+    }
+
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class FVG_HighestHigh_OverlapBot : Robot
+    {
+        #region General & Risk Parameters
+        [Parameter("Weekly Context Mode", Group = "Strategy Context", DefaultValue = WeeklyContextType.UsualFVG)]
+        public WeeklyContextType ContextMode { get; set; }
+
+        [Parameter("Risk per Trade (%)", Group = "Risk Management", DefaultValue = 1.0, MinValue = 0.1)]
+        public double RiskPerTradePercent { get; set; }
+
+        [Parameter("Reward Ratio (TP)", Group = "Risk Management", DefaultValue = 2.0)]
+        public double RewardRatio { get; set; }
+        #endregion
+
+        #region H4 Entry Parameters
+        [Parameter("H4 Lookback (Overlap)", Group = "H4 Entry Logic", DefaultValue = 20, MinValue = 1)]
+        public int Lookback { get; set; }
+
+        [Parameter("H4 Swing Lookback (SL)", Group = "H4 Entry Logic", DefaultValue = 5, MinValue = 1)]
+        public int SwingLookback { get; set; }
+
+        [Parameter("Ignoriere Datum (H4 Swing High)", Group = "H4 Entry Logic", DefaultValue = "2026-07-30")]
+        public string IgnoreDateString { get; set; }
+        #endregion
+
+        #region Weekly Context Parameters
+        [Parameter("Weekly Swing Lookback", Group = "Weekly Context", DefaultValue = 3, MinValue = 1)]
+        public int WeeklySwingLookback { get; set; }
+
+        [Parameter("Weekly FVG Lookback", Group = "Weekly Context", DefaultValue = 30, MinValue = 5)]
+        public int WeeklyFvgLookback { get; set; }
+        #endregion
+
+        private int _lastFvgBar = -1;
+        private DateTime? _ignoreDate;
+
+        // Weekly Timeframe Data & State
+        private Bars _weeklyBars;
+        private bool _weeklyContextActive = false;
+        private double _weeklyTargetHigh = double.MaxValue;
+        private double _weeklySwingLow = double.MinValue;
+        
+        // Usual FVG Levels
+        private double _weeklyFvgTop = 0;
+        private double _weeklyFvgBottom = 0;
+
+        protected override void OnStart()
+        {
+            if (DateTime.TryParse(IgnoreDateString, out DateTime parsedDate))
+            {
+                _ignoreDate = parsedDate.Date;
+                Print("📅 Kerzen vom Datum {0} werden beim H4 Swing High ignoriert.", _ignoreDate.Value.ToString("yyyy-MM-dd"));
+            }
+
+            // Native Wochen-Daten abrufen
+            _weeklyBars = MarketData.GetBars(TimeFrame.Weekly);
+        }
+
+        protected override void OnBar()
+        {
+            int i = Bars.Count - 1;
+            if (i < 30) return; // Genügend Historie auf H4 sicherstellen
+
+            // =========================================================================
+            // SCHRITT 1: WEEKLY CONTEXT UPDATE & EVALUATION
+            // =========================================================================
+            UpdateWeeklyContext();
+
+            double currentH4Low = Bars.LowPrices[i];
+            double currentH4High = Bars.HighPrices[i];
+
+            // --- EVALUIRUNG DES WEEKLY KONTEXTS ---
+            if (ContextMode == WeeklyContextType.WeeklySweep)
+            {
+                // A1) Sweep-Erkennung: H4 taucht unter das Weekly Swing Low
+                if (!_weeklyContextActive && _weeklySwingLow > 0 && currentH4Low < _weeklySwingLow)
+                {
+                    _weeklyContextActive = true;
+                    Print("🔥 [SWEEP] Kontext aktiviert! Low {0} hat Weekly Low {1} durchbrochen.", currentH4Low, _weeklySwingLow);
+                    Chart.DrawHorizontalLine("Weekly_Target_" + i, _weeklyTargetHigh, Color.Lime, 2, LineStyle.DotsVeryRare);
+                }
+            }
+            else if (ContextMode == WeeklyContextType.UsualFVG)
+            {
+                // A2) Usual FVG-Erkennung: H4 taucht in den Weekly FVG ein
+                if (!_weeklyContextActive && _weeklyFvgTop > 0 && _weeklyFvgBottom > 0)
+                {
+                    if (currentH4Low <= _weeklyFvgTop && currentH4High >= _weeklyFvgBottom)
+                    {
+                        _weeklyContextActive = true;
+                        Print("🔥 [USUAL FVG] Kontext aktiviert! Preis ist im Weekly FVG [{0} - {1}]", _weeklyFvgBottom, _weeklyFvgTop);
+                        Chart.DrawHorizontalLine("Weekly_Target_" + i, _weeklyTargetHigh, Color.Gold, 2, LineStyle.Solid);
+                    }
+                }
+            }
+
+            // B) Target Erreicht -> Kontext deaktivieren
+            if (_weeklyContextActive && currentH4High >= _weeklyTargetHigh)
+            {
+                _weeklyContextActive = false;
+                Print("🎯 WEEKLY TARGET ERREICHT ({0} >= {1})! Suche gestoppt.", currentH4High, _weeklyTargetHigh);
+                return;
+            }
+
+            if (!_weeklyContextActive)
+                return;
+
+            // =========================================================================
+            // SCHRITT 2: H4 ENTRY SETUP (FVG + OVERLAP)
+            // =========================================================================
+            
+            // 1. Bullisches H4 FVG
+            double gapBottom = Bars.HighPrices[i - 3];
+            double gapTop = Bars.LowPrices[i - 1];
+
+            if (gapBottom < gapTop && _lastFvgBar != i)
+            {
+                // 2. Swing High vor dem Gap suchen
+                double swingHighPrice = -1;
+                bool swingFound = false;
+
+                for (int j = i - 4; j >= i - 4 - Lookback && j >= 2; j--)
+                {
+                    if (_ignoreDate.HasValue && Bars.OpenTimes[j].Date == _ignoreDate.Value)
+                        continue;
+
+                    if (Bars.HighPrices[j] > Bars.HighPrices[j - 1] && 
+                        Bars.HighPrices[j] > Bars.HighPrices[j + 1])
+                    {
+                        swingHighPrice = Bars.HighPrices[j];
+                        swingFound = true;
+                        break;
+                    }
+                }
+
+                // 3. Overlap-Prüfung
+                bool validSetup = false;
+                double entryPrice = 0;
+
+                if (swingFound && swingHighPrice >= gapBottom && swingHighPrice <= gapTop)
+                {
+                    entryPrice = swingHighPrice;
+                    validSetup = true;
+                    Print("🎯 H4 Entry gefunden bei {0} (FVG: {1} - {2}) im {3}-Kontext", 
+                          entryPrice, gapBottom, gapTop, ContextMode);
+                }
+
+                if (!validSetup) return;
+
+                // 4. Stop Loss & Risk Management
+                double slPrice = GetLastSwingLowBody(i) - (2 * Symbol.PipSize);
+                if (slPrice >= entryPrice || slPrice <= 0) return;
+
+                double slPips = (entryPrice - slPrice) / Symbol.PipSize;
+                double tpPips = slPips * RewardRatio;
+
+                // 5. Positionen / Orders filtern
+                if (Positions.Any(p => p.Label == "FVG_Overlap" && p.SymbolName == SymbolName))
+                    return;
+
+                var existingOrders = PendingOrders.Where(o => o.Label == "FVG_Overlap" && o.SymbolName == SymbolName).ToList();
+                foreach (var order in existingOrders)
+                {
+                    CancelPendingOrder(order);
+                }
+
+                // 6. Order platzieren
+                double riskAmount = Account.Balance * (RiskPerTradePercent / 100.0);
+                double riskPerVolumeUnit = slPips * Symbol.PipValue;
+
+                if (riskPerVolumeUnit > 0)
+                {
+                    double rawVolume = riskAmount / riskPerVolumeUnit;
+                    double volume = Symbol.NormalizeVolumeInUnits(rawVolume);
+
+                    if (volume >= Symbol.VolumeInUnitsMin)
+                    {
+                        PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Overlap", slPips, tpPips);
+                        _lastFvgBar = i;
+
+                        Chart.DrawHorizontalLine("Entry_PD_" + i, entryPrice, Color.Gold, 2);
+                        Chart.DrawHorizontalLine("SL_" + i, slPrice, Color.Red, 1, LineStyle.Lines);
+                    }
+                }
+            }
+        }
+
+        // =========================================================================
+        // HILFSMETHODEN
+        // =========================================================================
+
+        private void UpdateWeeklyContext()
+        {
+            if (_weeklyBars == null || _weeklyBars.Count < 10) return;
+
+            // Nur vollständig geschlossene Weekly-Kerzen betrachten (Count - 2 als Referenz)
+            int wIndex = _weeklyBars.Count - 2;
+
+            if (ContextMode == WeeklyContextType.WeeklySweep)
+            {
+                UpdateWeeklySweepLevels(wIndex);
+            }
+            else if (ContextMode == WeeklyContextType.UsualFVG)
+            {
+                UpdateWeeklyFvgLevels(wIndex);
+            }
+        }
+
+        // Ermittelt das frischeste bullische Weekly FVG und dessen Target Swing High
+        private void UpdateWeeklyFvgLevels(int wIndex)
+        {
+            for (int w = wIndex; w >= wIndex - WeeklyFvgLookback && w >= 3; w--)
+            {
+                double gapBottom = _weeklyBars.HighPrices[w - 2];
+                double gapTop = _weeklyBars.LowPrices[w];
+
+                // Bullisches FVG im Weekly Timeframe
+                if (gapBottom < gapTop)
+                {
+                    _weeklyFvgBottom = gapBottom;
+                    _weeklyFvgTop = gapTop;
+
+                    // Target ist das Swing High vor/bei der Entstehung des FVG (Kerze w-1)
+                    _weeklyTargetHigh = _weeklyBars.HighPrices[w - 1];
+
+                    // Visualisiere die FVG Zone im Chart
+                    Chart.DrawRectangle("Weekly_FVG_Zone", _weeklyBars.OpenTimes[w - 2], _weeklyFvgTop, 
+                                        Server.Time.AddDays(30), _weeklyFvgBottom, Color.FromArgb(40, 0, 255, 0));
+                    return;
+                }
+            }
+        }
+
+        private void UpdateWeeklySweepLevels(int wIndex)
+        {
+            for (int w = wIndex; w >= wIndex - 15 && w >= WeeklySwingLookback; w--)
+            {
+                bool isSwingLow = true;
+                for (int k = 1; k <= WeeklySwingLookback; k++)
+                {
+                    if (_weeklyBars.LowPrices[w] >= _weeklyBars.LowPrices[w - k] ||
+                        _weeklyBars.LowPrices[w] >= _weeklyBars.LowPrices[w + k])
+                    {
+                        isSwingLow = false;
+                        break;
+                    }
+                }
+
+                if (isSwingLow)
+                {
+                    _weeklySwingLow = _weeklyBars.LowPrices[w];
+
+                    double highestHigh = double.MinValue;
+                    for (int h = w; h <= wIndex; h++)
+                    {
+                        if (_weeklyBars.HighPrices[h] > highestHigh)
+                            highestHigh = _weeklyBars.HighPrices[h];
+                    }
+
+                    if (highestHigh > _weeklySwingLow)
+                        _weeklyTargetHigh = highestHigh;
+
+                    break;
+                }
+            }
+        }
+
+        private double GetLastSwingLowBody(int fromIndex)
+        {
+            int minIndex = Math.Max(0, fromIndex - 30);
+            for (int j = fromIndex - 2; j >= minIndex; j--)
+            {
+                double bodyLow = Math.Min(Bars.OpenPrices[j], Bars.ClosePrices[j]);
+                bool isSwing = true;
+
+                for (int k = 1; k <= SwingLookback; k++)
+                {
+                    if (j - k < 0)
+                    {
+                        isSwing = false;
+                        break;
+                    }
+                    double neighborLow = Math.Min(Bars.OpenPrices[j - k], Bars.ClosePrices[j - k]);
+                    if (bodyLow > neighborLow)
+                    {
+                        isSwing = false;
+                        break;
+                    }
+                }
+
+                if (isSwing) return bodyLow;
+            }
+
+            return Bars.LowPrices[fromIndex - 3];
+        }
+    }
+}
