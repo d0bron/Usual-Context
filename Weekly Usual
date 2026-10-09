@@ -14,7 +14,7 @@ namespace cAlgo.Robots
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
     public class FVG_HighestHigh_OverlapBot : Robot
     {
-        #region General & Risk Parameters
+        #region Risk Management Parameters
         [Parameter("Weekly Context Mode", Group = "Strategy Context", DefaultValue = WeeklyContextType.UsualFVG)]
         public WeeklyContextType ContextMode { get; set; }
 
@@ -47,97 +47,104 @@ namespace cAlgo.Robots
         private int _lastFvgBar = -1;
         private DateTime? _ignoreDate;
 
-        // Weekly Timeframe Data & State
+        // Weekly Timeframe Multi-Timeframe Series
         private Bars _weeklyBars;
         private bool _weeklyContextActive = false;
         private double _weeklyTargetHigh = double.MaxValue;
         private double _weeklySwingLow = double.MinValue;
-        
+
         // Usual FVG Levels
         private double _weeklyFvgTop = 0;
         private double _weeklyFvgBottom = 0;
 
         protected override void OnStart()
         {
+            // Parse das zu ignorierende Datum
             if (DateTime.TryParse(IgnoreDateString, out DateTime parsedDate))
             {
                 _ignoreDate = parsedDate.Date;
                 Print("📅 Kerzen vom Datum {0} werden beim H4 Swing High ignoriert.", _ignoreDate.Value.ToString("yyyy-MM-dd"));
             }
 
-            // Native Wochen-Daten abrufen
+            // Hole native Wochen-Daten direkt vom Server
             _weeklyBars = MarketData.GetBars(TimeFrame.Weekly);
         }
 
         protected override void OnBar()
         {
             int i = Bars.Count - 1;
-            if (i < 30) return; // Genügend Historie auf H4 sicherstellen
+            if (i < 30) return; // Genügend Historie sicherstellen
 
             // =========================================================================
-            // SCHRITT 1: WEEKLY CONTEXT UPDATE & EVALUATION
+            // SCHRITT 1: WEEKLY CONTEXT UPDATE & EVALUATION (H4 ECHTZEIT)
             // =========================================================================
             UpdateWeeklyContext();
 
             double currentH4Low = Bars.LowPrices[i];
             double currentH4High = Bars.HighPrices[i];
 
-            // --- EVALUIRUNG DES WEEKLY KONTEXTS ---
+            // A) Kontext-Aktivierung
             if (ContextMode == WeeklyContextType.WeeklySweep)
             {
-                // A1) Sweep-Erkennung: H4 taucht unter das Weekly Swing Low
                 if (!_weeklyContextActive && _weeklySwingLow > 0 && currentH4Low < _weeklySwingLow)
                 {
                     _weeklyContextActive = true;
-                    Print("🔥 [SWEEP] Kontext aktiviert! Low {0} hat Weekly Low {1} durchbrochen.", currentH4Low, _weeklySwingLow);
+                    Print("🔥 [SWEEP] WEEKLY SWEEP BESTÄTIGT! Low ({0}) hat Weekly Low ({1}) durchbrochen.", currentH4Low, _weeklySwingLow);
                     Chart.DrawHorizontalLine("Weekly_Target_" + i, _weeklyTargetHigh, Color.Lime, 2, LineStyle.DotsVeryRare);
                 }
             }
             else if (ContextMode == WeeklyContextType.UsualFVG)
             {
-                // A2) Usual FVG-Erkennung: H4 taucht in den Weekly FVG ein
                 if (!_weeklyContextActive && _weeklyFvgTop > 0 && _weeklyFvgBottom > 0)
                 {
                     if (currentH4Low <= _weeklyFvgTop && currentH4High >= _weeklyFvgBottom)
                     {
                         _weeklyContextActive = true;
-                        Print("🔥 [USUAL FVG] Kontext aktiviert! Preis ist im Weekly FVG [{0} - {1}]", _weeklyFvgBottom, _weeklyFvgTop);
-                        Chart.DrawHorizontalLine("Weekly_Target_" + i, _weeklyTargetHigh, Color.Gold, 2, LineStyle.Solid);
+                        Print("🔥 [USUAL FVG] WEEKLY FVG BETRETEN! Preis [{0}] in Zone [{1} - {2}]. Target: {3}", 
+                              currentH4Low, _weeklyFvgBottom, _weeklyFvgTop, _weeklyTargetHigh);
+                        
+                        // Gelbe Target-Linie genau wie im Screenshot zeichnen
+                        Chart.DrawHorizontalLine("Weekly_Target_Line_" + i, _weeklyTargetHigh, Color.Gold, 3, LineStyle.Solid);
                     }
                 }
             }
 
-            // B) Target Erreicht -> Kontext deaktivieren
+            // B) Target erreicht: H4 erreicht/übersteigt das Weekly Target High -> Kontext deaktivieren
             if (_weeklyContextActive && currentH4High >= _weeklyTargetHigh)
             {
                 _weeklyContextActive = false;
-                Print("🎯 WEEKLY TARGET ERREICHT ({0} >= {1})! Suche gestoppt.", currentH4High, _weeklyTargetHigh);
+                Print("🎯 WEEKLY TARGET ERREICHT! H4-Hoch ({0}) hat Weekly Target ({1}) getroffen. Suche gestoppt.", currentH4High, _weeklyTargetHigh);
                 return;
             }
 
             if (!_weeklyContextActive)
+            {
                 return;
+            }
 
             // =========================================================================
-            // SCHRITT 2: H4 ENTRY SETUP (FVG + OVERLAP)
+            // SCHRITT 2: H4 ENTRY SETUP (LIMIT AN FVG OBERKANTE UNTER KERZE 3 + OVERLAP)
             // =========================================================================
-            
-            // 1. Bullisches H4 FVG
+
+            // 1. Bullische FVG-Erkennung (3-Kerzen-Muster im H4 Chart)
             double gapBottom = Bars.HighPrices[i - 3];
-            double gapTop = Bars.LowPrices[i - 1];
+            double gapTop = Bars.LowPrices[i - 1]; // Unterkante der 3. Kerze
 
             if (gapBottom < gapTop && _lastFvgBar != i)
             {
-                // 2. Swing High vor dem Gap suchen
+                // 2. Swing High Suche vor dem Gap
                 double swingHighPrice = -1;
                 bool swingFound = false;
 
                 for (int j = i - 4; j >= i - 4 - Lookback && j >= 2; j--)
                 {
                     if (_ignoreDate.HasValue && Bars.OpenTimes[j].Date == _ignoreDate.Value)
+                    {
+                        Print("⚠️ H4 Swing High am {0} wird ignoriert.", Bars.OpenTimes[j].ToString("yyyy-MM-dd"));
                         continue;
+                    }
 
-                    if (Bars.HighPrices[j] > Bars.HighPrices[j - 1] && 
+                    if (Bars.HighPrices[j] > Bars.HighPrices[j - 1] &&
                         Bars.HighPrices[j] > Bars.HighPrices[j + 1])
                     {
                         swingHighPrice = Bars.HighPrices[j];
@@ -146,38 +153,43 @@ namespace cAlgo.Robots
                     }
                 }
 
-                // 3. Overlap-Prüfung
+                // 3. Einstiegs-Logik: Limit Order an der Oberkante des FVG (Tief der 3. Kerze)
                 bool validSetup = false;
                 double entryPrice = 0;
 
-                if (swingFound && swingHighPrice >= gapBottom && swingHighPrice <= gapTop)
+                if (swingFound)
                 {
-                    entryPrice = swingHighPrice;
-                    validSetup = true;
-                    Print("🎯 H4 Entry gefunden bei {0} (FVG: {1} - {2}) im {3}-Kontext", 
-                          entryPrice, gapBottom, gapTop, ContextMode);
+                    // Overlap-Bedingung: Swing High liegt in der FVG-Zone
+                    if (swingHighPrice >= gapBottom && swingHighPrice <= gapTop)
+                    {
+                        entryPrice = gapTop; // Einstieg exakt an FVG-Oberkante
+                        validSetup = true;
+                        Print("🎯 H4 Entry gefunden: Limit bei {0} (FVG Top) | Swing Overlap: {1}", entryPrice, swingHighPrice);
+                    }
                 }
 
                 if (!validSetup) return;
 
-                // 4. Stop Loss & Risk Management
+                // 4. Stop Loss & Take Profit ermitteln
                 double slPrice = GetLastSwingLowBody(i) - (2 * Symbol.PipSize);
                 if (slPrice >= entryPrice || slPrice <= 0) return;
 
                 double slPips = (entryPrice - slPrice) / Symbol.PipSize;
                 double tpPips = slPips * RewardRatio;
 
-                // 5. Positionen / Orders filtern
+                // 5. Keine neue Order setzen, wenn bereits eine Position aktiv ist
                 if (Positions.Any(p => p.Label == "FVG_Overlap" && p.SymbolName == SymbolName))
                     return;
 
+                // 6. Alte schwebende Orders löschen (Cancel & Replace)
                 var existingOrders = PendingOrders.Where(o => o.Label == "FVG_Overlap" && o.SymbolName == SymbolName).ToList();
                 foreach (var order in existingOrders)
                 {
                     CancelPendingOrder(order);
+                    Print("🗑️ Alte Pending Order {0} gelöscht für neue Limit Order.", order.Id);
                 }
 
-                // 6. Order platzieren
+                // 7. Risikoberechnung & Platzierung der neuen Limit Order
                 double riskAmount = Account.Balance * (RiskPerTradePercent / 100.0);
                 double riskPerVolumeUnit = slPips * Symbol.PipValue;
 
@@ -191,7 +203,9 @@ namespace cAlgo.Robots
                         PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Overlap", slPips, tpPips);
                         _lastFvgBar = i;
 
-                        Chart.DrawHorizontalLine("Entry_PD_" + i, entryPrice, Color.Gold, 2);
+                        // Visualisierung auf dem Chart
+                        Chart.DrawHorizontalLine("Entry_Limit_" + i, entryPrice, Color.Gold, 2, LineStyle.Solid);
+                        Chart.DrawHorizontalLine("Swing_Overlap_" + i, swingHighPrice, Color.Orange, 1, LineStyle.Dots);
                         Chart.DrawHorizontalLine("SL_" + i, slPrice, Color.Red, 1, LineStyle.Lines);
                     }
                 }
@@ -206,7 +220,6 @@ namespace cAlgo.Robots
         {
             if (_weeklyBars == null || _weeklyBars.Count < 10) return;
 
-            // Nur vollständig geschlossene Weekly-Kerzen betrachten (Count - 2 als Referenz)
             int wIndex = _weeklyBars.Count - 2;
 
             if (ContextMode == WeeklyContextType.WeeklySweep)
@@ -219,7 +232,7 @@ namespace cAlgo.Robots
             }
         }
 
-        // Ermittelt das frischeste bullische Weekly FVG und dessen Target Swing High
+        // Ermittelt das Weekly FVG sowie das Swing High als Target (über den FVG-Kerzen)
         private void UpdateWeeklyFvgLevels(int wIndex)
         {
             for (int w = wIndex; w >= wIndex - WeeklyFvgLookback && w >= 3; w--)
@@ -227,17 +240,18 @@ namespace cAlgo.Robots
                 double gapBottom = _weeklyBars.HighPrices[w - 2];
                 double gapTop = _weeklyBars.LowPrices[w];
 
-                // Bullisches FVG im Weekly Timeframe
                 if (gapBottom < gapTop)
                 {
                     _weeklyFvgBottom = gapBottom;
                     _weeklyFvgTop = gapTop;
 
-                    // Target ist das Swing High vor/bei der Entstehung des FVG (Kerze w-1)
-                    _weeklyTargetHigh = _weeklyBars.HighPrices[w - 1];
+                    // Target High: Das höchste Hoch der FVG-Entstehungskerzen (w-2, w-1, w)
+                    double maxHigh = Math.Max(_weeklyBars.HighPrices[w - 2], 
+                                     Math.Max(_weeklyBars.HighPrices[w - 1], _weeklyBars.HighPrices[w]));
+                    _weeklyTargetHigh = maxHigh;
 
-                    // Visualisiere die FVG Zone im Chart
-                    Chart.DrawRectangle("Weekly_FVG_Zone", _weeklyBars.OpenTimes[w - 2], _weeklyFvgTop, 
+                    // Visualisierung der Weekly FVG Zone
+                    Chart.DrawRectangle("Weekly_FVG_Zone", _weeklyBars.OpenTimes[w - 2], _weeklyFvgTop,
                                         Server.Time.AddDays(30), _weeklyFvgBottom, Color.FromArgb(40, 0, 255, 0));
                     return;
                 }
